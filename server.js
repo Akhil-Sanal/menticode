@@ -20,12 +20,17 @@ line();
 log('🔧', 'STARTUP DIAGNOSTICS');
 line();
 
+// On Railway, .env is not a file — env vars come from the dashboard
+const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 const envPath = path.join(__dirname, '.env');
-if (!fs.existsSync(envPath)) {
+if (isRailway) {
+  log('✅', 'Running on Railway — using dashboard env vars');
+} else if (!fs.existsSync(envPath)) {
   log('❌', `.env NOT found at ${envPath}`);
   process.exit(1);
+} else {
+  log('✅', '.env file found');
 }
-log('✅', '.env file found');
 
 const REQUIRED = ['JWT_SECRET', 'EXAMINER_PASSWORD', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY'];
 let envOK = true;
@@ -81,10 +86,16 @@ async function testSupabase() {
    ============================================================ */
 const issueToken = () => jwt.sign({ role: 'examiner' }, process.env.JWT_SECRET, { expiresIn: '12h' });
 const verifyToken = (t) => { try { return jwt.verify(t, process.env.JWT_SECRET); } catch { return null; } };
+
+// Accept token from cookie OR Authorization header OR ?token= query
 const requireExaminer = (req, res, next) => {
-  const t = req.cookies?.token;
+  const cookieTok = req.cookies?.token;
+  const headerTok = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  const queryTok = req.query.token;
+  const t = cookieTok || headerTok || queryTok;
   const p = t && verifyToken(t);
   if (p?.role !== 'examiner') return res.status(401).json({ error: 'unauthorized' });
+  req.examiner = p;
   next();
 };
 
@@ -143,7 +154,6 @@ const DB = {
     return data.id;
   },
 
-  // No time_taken anymore — only code, language, and submitted_at
   saveSubmission: async (roomCode, studentId, code, language) => {
     const { data, error } = await sb.from('submissions').upsert({
       room_code: roomCode,
@@ -163,7 +173,6 @@ const DB = {
     return data;
   },
 
-  // Leaderboard = submissions only, sorted by submission order (earliest first)
   getLeaderboard: async (roomCode) => {
     const { data, error } = await sb.from('submissions')
       .select('student_id, submitted_at, students(name)')
@@ -189,7 +198,11 @@ const DB = {
    ============================================================ */
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: { origin: '*', credentials: true },
+  pingTimeout: 60000,
+  pingInterval: 25000
+});
 app.use(express.json());
 app.use(cookieParser());
 
@@ -251,7 +264,7 @@ const EXAMINER_HTML = `<!DOCTYPE html><html><head><title>Examiner</title>
   <div>🎛️ Examiner — Room <strong id="roomCode">—</strong> <span id="status" class="pill idle">idle</span></div>
   <div>
     <button id="startBtn" onclick="start()" disabled>▶ Start</button>
-    <button class="danger" onclick="reset()" disabled>⟲ Reset</button>
+    <button class="danger" onclick="newRoom()" disabled>⟲ New Room</button>
   </div>
 </header>
 <div id="setup" class="card" style="max-width:520px;margin:40px auto">
@@ -278,17 +291,39 @@ const EXAMINER_HTML = `<!DOCTYPE html><html><head><title>Examiner</title>
 let socket,roomCode=null;
 const $=id=>document.getElementById(id);
 
+function authHeaders(extra){
+  const t=localStorage.getItem('examiner_token')||'';
+  return Object.assign({'Authorization':'Bearer '+t},extra||{});
+}
+
 (async()=>{
+  const token=localStorage.getItem('examiner_token');
+  if(!token) return location.href='/login';
+
   try{
-    const r=await fetch('/api/questions');
-    if(r.status===401) return location.href='/login';
-    const qs=await r.json();
-    if(!qs.length){
-      $('qSel').innerHTML='<option value="">— No questions —</option>';
-      return;
+    const r=await fetch('/api/questions',{headers:authHeaders()});
+    if(r.status===401){
+      localStorage.removeItem('examiner_token');
+      localStorage.removeItem('examiner_room');
+      return location.href='/login';
     }
-    $('qSel').innerHTML=qs.map(q=>'<option value="'+q.id+'">'+q.title+'</option>').join('');
-  }catch(e){ $('setupErr').textContent='Error: '+e.message; }
+    const qs=await r.json();
+    $('qSel').innerHTML=qs.length
+      ? qs.map(q=>'<option value="'+q.id+'">'+q.title+'</option>').join('')
+      : '<option value="">— No questions —</option>';
+  }catch(e){ $('setupErr').textContent='Error: '+e.message; return; }
+
+  const savedRoom=localStorage.getItem('examiner_room');
+  if(savedRoom){
+    try{
+      const r=await fetch('/api/rooms/'+savedRoom+'/exists',{headers:authHeaders()});
+      if(r.ok){
+        const {exists}=await r.json();
+        if(exists){ resumeRoom(savedRoom); return; }
+      }
+    }catch(e){}
+    localStorage.removeItem('examiner_room');
+  }
 })();
 
 async function createRoom(){
@@ -296,10 +331,18 @@ async function createRoom(){
   const qid=$('qSel').value;
   if(!qid) return $('setupErr').textContent='No question selected';
 
-  const r=await fetch('/api/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({questionId:qid})});
+  const r=await fetch('/api/rooms',{
+    method:'POST',
+    headers:authHeaders({'Content-Type':'application/json'}),
+    body:JSON.stringify({questionId:qid})
+  });
   if(!r.ok) return $('setupErr').textContent='Create failed: '+await r.text();
   const {code}=await r.json();
+  localStorage.setItem('examiner_room',code);
+  resumeRoom(code);
+}
 
+function resumeRoom(code){
   roomCode=code;
   $('roomCode').textContent=code;
   $('setup').style.display='none';
@@ -332,9 +375,7 @@ async function createRoom(){
       $('board').innerHTML=list.map((s,i)=>
         '<div class="row" onclick="viewStudent(\\''+s.id+'\\')">'+
           '<div><span class="rank">#'+(i+1)+'</span>'+esc(s.name)+'</div>'+
-          '<div>'+
-            '<button class="remove-btn" onclick="event.stopPropagation();removeStudent(\\''+s.id+'\\',\\''+esc(s.name)+'\\')">Remove</button>'+
-          '</div>'+
+          '<div><button class="remove-btn" onclick="event.stopPropagation();removeStudent(\\''+s.id+'\\',\\''+esc(s.name)+'\\')">Remove</button></div>'+
         '</div>').join('');
     }
     $('count').textContent='('+list.length+')';
@@ -351,13 +392,17 @@ async function createRoom(){
       '<pre>'+esc(s.code||'// no submission')+'</pre>';
   });
 
-  socket.on('student:kicked',({studentId})=>{
+  socket.on('student:kicked',()=>{
     $('detail').innerHTML='<p class="muted">Student was removed.</p>';
   });
 }
 
 function start(){socket.emit('examiner:start');}
-function reset(){if(confirm('Reset all submissions and students?'))socket.emit('examiner:reset');}
+function newRoom(){
+  if(!confirm('Leave this room and create a new one?')) return;
+  localStorage.removeItem('examiner_room');
+  location.reload();
+}
 function viewStudent(id){socket.emit('examiner:view',{studentId:id});}
 function removeStudent(id,name){
   if(!confirm('Remove '+name+' from this room? Their submission will be deleted.')) return;
@@ -410,13 +455,19 @@ editor=CodeMirror.fromTextArea($('editor'),{
 const m=location.pathname.match(/\\/join\\/([A-Z0-9]+)/i)||location.pathname.match(/^\\/([A-F0-9]{6})$/i);
 if(m) $('code').value=m[1].toUpperCase();
 
+const savedName=localStorage.getItem('student_name');
+if(savedName) $('name').value=savedName;
+
 function join(){
   const code=$('code').value.trim().toUpperCase();
   const name=$('name').value.trim();
   if(!code||!name){$('err').textContent='Enter code and name';return;}
+  localStorage.setItem('student_name',name);
   socket.emit('student:join',{code,name});
 }
 socket.on('join:error',msg=>$('err').textContent=msg);
+
+if(m && savedName) setTimeout(join,300);
 
 socket.on('room:state',s=>{
   room=s;
@@ -441,9 +492,7 @@ socket.on('round:start',()=>{
   $('submitBtn').textContent='Submit';
 });
 
-socket.on('round:end',()=>{
-  $('submitBtn').disabled=true;
-});
+socket.on('round:end',()=>{$('submitBtn').disabled=true;});
 
 socket.on('round:reset',()=>{
   $('submitBtn').disabled=false;
@@ -454,7 +503,8 @@ socket.on('round:reset',()=>{
 
 socket.on('student:kicked',()=>{
   alert('You have been removed from this room by the examiner.');
-  location.reload();
+  localStorage.removeItem('student_name');
+  location.href='/student';
 });
 
 function submit(){
@@ -466,9 +516,7 @@ function submit(){
   socket.emit('student:submit',{code:editor.getValue(),language:$('lang').value});
 }
 
-socket.on('submitted:ack',()=>{
-  $('status').textContent='✅ Submitted';
-});
+socket.on('submitted:ack',()=>{$('status').textContent='✅ Submitted';});
 </script></body></html>`;
 
 /* ---------- API ROUTES ---------- */
@@ -491,6 +539,13 @@ app.post('/api/rooms', requireExaminer, async (req, res) => {
     await DB.createRoom(code, req.body.questionId);
     console.log(`✅ Room created: ${code}`);
     res.json({ code });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/rooms/:code/exists', requireExaminer, async (req, res) => {
+  try {
+    const room = await DB.getRoom(req.params.code);
+    res.json({ exists: !!room, code: req.params.code });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -598,8 +653,6 @@ io.on('connection', (socket) => {
     if (!isExaminer || !roomCode) return;
     try {
       const sid = payload.studentId;
-      console.log(`🗑️ Examiner removing student ${sid.slice(0, 8)}`);
-
       const sSocket = studentSockets.get(sid);
       if (sSocket) {
         io.to(sSocket).emit('student:kicked');
@@ -616,7 +669,6 @@ io.on('connection', (socket) => {
     try {
       const room = await DB.getRoom(roomCode);
       const lang = payload.language || room.language;
-
       await DB.saveSubmission(roomCode, studentId, payload.code, lang);
       socket.emit('submitted:ack', {});
       await emitLeaderboard(roomCode);
@@ -655,14 +707,15 @@ function shapeState(room) {
 
 async function emitLeaderboard(roomCode) {
   const list = await DB.getLeaderboard(roomCode);
+  io.to(roomCode).list = list; // no-op, keeps linter happy
   io.to(roomCode).emit('leaderboard', list);
 }
 
 /* ============================================================
-   BOOT
+   BOOT — ✅ Railway fix: bind to 0.0.0.0
    ============================================================ */
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, async () => {
-  console.log(`\n🌐 Server listening on http://localhost:${PORT}`);
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`\n🌐 Server listening on port ${PORT} (0.0.0.0)`);
   await testSupabase();
 });
