@@ -4,7 +4,7 @@
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "engines": {
-    "node": ">=20"
+    "node": "22.x"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.58.0",
